@@ -327,6 +327,46 @@ describe.skipIf(!executablePath)("motion-signature.browser in Chromium", () => {
     expect(after.liveness).not.toBe(before.liveness);
   });
 
+  // Blink reports a 290x0 box for this path (object bounding box, no stroke),
+  // so this also pins that a stroked straight connector counts as visible.
+  it("sees a stroke-dashoffset draw-in on a straight connector", async () => {
+    await load(
+      composition(
+        "#wire { stroke: #000; stroke-width: 4; fill: none; stroke-dasharray: 290; stroke-dashoffset: 290; }",
+        '<svg width="640" height="360"><path id="wire" d="M 10 10 L 300 10"/></svg>',
+      ),
+    );
+    const before = await sample();
+    await mutate('document.getElementById("wire").style.strokeDashoffset = "145"');
+    const after = await sample();
+
+    expect(after.sweep).not.toBe(before.sweep);
+    expect(after.liveness).not.toBe(before.liveness);
+  });
+
+  // Blink already reports an empty box inside <defs> / <clipPath>; this pins
+  // that the platform and the classifier agree, not the container rule alone.
+  it("ignores stroke-dash motion under display:none and inside <defs> / <clipPath>", async () => {
+    await load(
+      composition(
+        "path { stroke: #000; stroke-width: 4; fill: none; stroke-dasharray: 290; stroke-dashoffset: 290; } #offstage { display: none; }",
+        `<svg width="640" height="360">
+          <g id="offstage"><path id="hidden" d="M 10 10 L 300 10"/></g>
+          <defs><path id="template" d="M 10 20 L 300 20"/></defs>
+          <clipPath id="reveal"><path id="clip" d="M 10 30 L 300 30"/></clipPath>
+          <rect id="anchor" x="10" y="100" width="200" height="50" fill="#f00"/>
+        </svg>`,
+      ),
+    );
+    const before = await sample();
+    await mutate(
+      'for (const id of ["hidden", "template", "clip"]) document.getElementById(id).style.strokeDashoffset = "0"',
+    );
+    const after = await sample();
+
+    expect(after).toEqual(before);
+  });
+
   it("sees textarea value and checkbox indeterminate changes", async () => {
     await load(
       composition(

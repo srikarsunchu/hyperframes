@@ -19,7 +19,7 @@
 // bucketing, while the sweep guard wants exact (0.01) rounding because it asks
 // whether the seek moved anything at all.
 //
-// Adding a channel (e.g. SVG stroke-dasharray/dashoffset): append one reader
+// Adding a channel (e.g. SVG fill-opacity): append one reader
 // `(element, ctx) => string` to ELEMENT_CHANNELS. `ctx` carries the element's
 // computed style, its ::before/::after styles, its inherited opacity, and the
 // quantize flag. A reader returns a string that is equal between two samples
@@ -33,6 +33,17 @@
 (function () {
   const IGNORE_TAGS = new Set(["SCRIPT", "STYLE", "TEMPLATE", "NOSCRIPT", "META", "LINK"]);
   const MEDIA_TAGS = new Set(["CANVAS", "VIDEO", "IMG"]);
+  // SVG containers whose direct content is never painted: <defs> and
+  // <clipPath> only lend geometry to a referencing element, and <symbol>
+  // renders only as <use> instances, whose shadow trees querySelectorAll
+  // cannot reach. Blink happens to report an empty box for their descendants,
+  // but a never-painted subtree should be excluded by rule, not by one
+  // engine's bbox behaviour. SVG tag names are case-preserved (`clipPath`),
+  // hence the lower-cased match.
+  const UNPAINTED_SVG_CONTAINERS = new Set(["defs", "clippath", "symbol"]);
+  // A computed stroke that paints nothing: `none`, or a fully transparent
+  // colour (`transparent` computes to rgba(0, 0, 0, 0)).
+  const TRANSPARENT_COLOR = /^(?:transparent|rgba\([^)]*,\s*0(?:\.0+)?\))$/;
   const FNV_OFFSET_BASIS = 2166136261;
   const FNV_PRIME = 16777619;
   const LIVENESS_POSITION_BUCKET_PX = 2;
@@ -71,7 +82,35 @@
     );
   }
 
-  // Same visibility floor as layout-audit.browser.js isVisibleElement's default.
+  // `display` is not inherited: a child of a display:none parent still
+  // computes display:block, and a shape inside <defs> computes as painted. A
+  // subtree starts here when nothing under it can generate a box.
+  function startsHiddenSubtree(element, style) {
+    return style.display === "none" || UNPAINTED_SVG_CONTAINERS.has(element.tagName.toLowerCase());
+  }
+
+  function paintsStroke(style) {
+    const stroke = cssValue(style.stroke);
+    return (
+      stroke !== "" &&
+      !TRANSPARENT_COLOR.test(stroke) &&
+      Number.parseFloat(style.strokeWidth) > 0 &&
+      Number.parseFloat(style.strokeOpacity) > 0
+    );
+  }
+
+  // An SVG geometry element (path/circle/ellipse/rect/line/polyline/polygon)
+  // with a painted stroke. Chromium's getBoundingClientRect for SVG shapes is
+  // the object bounding box WITHOUT the stroke, so a straight horizontal or
+  // vertical connector reports 0 height or 0 width regardless of stroke-width
+  // even though it is plainly on screen.
+  function isStrokedShape(element, style) {
+    return element instanceof SVGGeometryElement && paintsStroke(style);
+  }
+
+  // layout-audit.browser.js isVisibleElement's default floor, widened by one
+  // case: a stroked SVG shape whose geometry bbox is degenerate along one axis
+  // (see isStrokedShape) is on screen even though that floor rejects it.
   // The author opt-out (data-layout-ignore / data-layout-check=ignore) is NOT
   // applied here: motion-sample reports this bit for explicitly asserted
   // selectors, and an assertion naming an element outranks a layout-audit
@@ -81,10 +120,13 @@
   // fallow-ignore-next-line complexity
   function isVisibleElement(element, style, opacity) {
     if (IGNORE_TAGS.has(element.tagName)) return false;
-    if (isHiddenStyle(style || getComputedStyle(element))) return false;
+    const computed = style || getComputedStyle(element);
+    if (isHiddenStyle(computed)) return false;
     if ((opacity === undefined ? opacityChain(element) : opacity) < 0.2) return false;
     const rect = element.getBoundingClientRect();
-    return rect.width > 0.5 && rect.height > 0.5;
+    if (rect.width > 0.5 && rect.height > 0.5) return true;
+    // A stroked shape paints along its one non-degenerate axis.
+    return isStrokedShape(element, computed) && (rect.width > 0.5 || rect.height > 0.5);
   }
 
   function foldField(hash, value) {
@@ -140,6 +182,25 @@
   function clipPathChannel(element, ctx) {
     const clip = cssValue(ctx.style.clipPath);
     return clip ? hashFields([clip]) : "";
+  }
+
+  // `none` and an all-zero list (`0`, `0px 0px`) both render a solid stroke,
+  // on which the offset has no visible effect.
+  function dashPattern(style) {
+    const dashes = cssValue(style.strokeDasharray);
+    if (!dashes) return "";
+    return dashes.split(/[\s,]+/).some((dash) => Number.parseFloat(dash) > 0) ? dashes : "";
+  }
+
+  // A "draw the line in" SVG entrance animates stroke-dasharray /
+  // stroke-dashoffset on a shape whose geometry never changes: no box, no
+  // opacity, only how much of the stroke is currently dash-visible. Without a
+  // dash pattern the offset has no visible effect, and without a painted
+  // stroke neither does, so ordinary shapes stay "".
+  function strokeDashChannel(element, ctx) {
+    if (!isStrokedShape(element, ctx.style)) return "";
+    const dashes = dashPattern(ctx.style);
+    return dashes ? hashFields([dashes, ctx.style.strokeDashoffset || ""]) : "";
   }
 
   // Direct text nodes only: descendants are signed separately, and a hidden
@@ -228,6 +289,7 @@
     opacityChannel,
     fontAxesChannel,
     clipPathChannel,
+    strokeDashChannel,
     textChannel,
     controlChannel,
     generatedContentChannel,
@@ -326,7 +388,7 @@
     for (const element of [root, ...root.querySelectorAll("*")]) {
       if (IGNORE_TAGS.has(element.tagName)) continue;
       const style = getComputedStyle(element);
-      if (style.display === "none" || hiddenSubtree.has(element.parentElement)) {
+      if (startsHiddenSubtree(element, style) || hiddenSubtree.has(element.parentElement)) {
         hiddenSubtree.add(element);
         continue;
       }
